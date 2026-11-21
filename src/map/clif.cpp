@@ -11183,6 +11183,9 @@ void clif_parse_LoadEndAck(int32 fd,map_session_data *sd)
 
 	sd->state.connect_new = 0;
 	sd->state.changemap = false;
+
+	if (!population_engine_is_population_pc(sd->id))
+		population_engine_on_real_player_enter_map(sd);
 }
 
 

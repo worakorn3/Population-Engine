@@ -51,6 +51,9 @@ void population_engine_stop();
 PopulationEngineStats population_engine_get_stats();
 bool population_engine_is_running();
 bool population_engine_is_population_pc(int32_t id);
+/// Called when a real (non-shell) player finishes loading a map (clif_parse_LoadEndAck).
+/// Schedules a short debounced autosummon pass when proximity active-map spawning is enabled.
+void population_engine_on_real_player_enter_map(map_session_data *sd);
 /// Complete a registered shell's local pc_setpos warp without a client LoadEndAck.
 /// Initial unregistered spawns are left to population_engine_place_shell.
 bool population_engine_complete_shell_warp(map_session_data* sd);

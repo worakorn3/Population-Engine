@@ -92,6 +92,8 @@ static std::unordered_map<int32, t_tick> g_pop_chat_next_tick; ///< Per-shell ne
 static int32 g_pop_chat_timer = INVALID_TIMER;
 static int32 g_population_combat_global_timer = INVALID_TIMER;
 static int32 g_population_companion_timer = INVALID_TIMER;
+static int32 g_pop_proximity_trigger_timer = INVALID_TIMER;
+static std::unordered_map<int16_t, t_tick> g_pop_map_last_active_tick;
 static std::unordered_set<int32> g_population_companions;
 static size_t g_chat_cursor = 0;    ///< Round-robin index for batched chat replies.
 // Last count written to cp_population_stats; UINT32_MAX = never written.
@@ -1098,8 +1100,59 @@ static void population_engine_write_count_sql(uint32_t count)
 	g_last_db_written_count = count;
 }
 
+static void population_engine_remove_managed_shell(map_session_data* bot);
+
+static int32 pop_collect_real_player_maps_cb(map_session_data *sd, va_list ap)
+{
+	if (sd == nullptr || population_engine_is_population_pc(sd->id))
+		return 0;
+	if (!sd->state.active || sd->prev == nullptr || sd->m < 0)
+		return 0;
+	auto *direct_maps = va_arg(ap, std::unordered_set<int16_t> *);
+	direct_maps->insert(sd->m);
+	return 0;
+}
+
+static void population_engine_collect_active_maps(
+	std::unordered_set<int16_t>& direct_maps,
+	std::unordered_set<int16_t>& active_maps,
+	std::unordered_set<int16_t>& vendor_maps)
+{
+	map_foreachpc(pop_collect_real_player_maps_cb, &direct_maps);
+	active_maps = direct_maps;
+
+	std::vector<int16_t> frontier(direct_maps.begin(), direct_maps.end());
+	const int max_hops = std::max(0, battle_config.population_engine_active_map_hops);
+	for (int hop = 0; hop < max_hops && !frontier.empty(); ++hop) {
+		std::vector<int16_t> next_frontier;
+		for (const int16_t mid : frontier) {
+			const struct map_data* md = map_getmapdata(mid);
+			if (!md)
+				continue;
+			for (int32 i = 0; i < md->npc_num_warp; ++i) {
+				const npc_data* nd = md->npc[i];
+				if (!nd || nd->subtype != NPCTYPE_WARP || nd->u.warp.mapindex == 0)
+					continue;
+				const int16 dest = map_mapindex2mapid(nd->u.warp.mapindex);
+				if (dest >= 0 && dest != mid && active_maps.insert(dest).second)
+					next_frontier.push_back(dest);
+			}
+		}
+		frontier = std::move(next_frontier);
+	}
+
+	for (const auto& kv : population_vendor_db().placements()) {
+		for (const auto& pair : kv.second) {
+			const int16 mid = map_mapname2mapid(pair.second.map.c_str());
+			if (mid >= 0)
+				vendor_maps.insert(mid);
+		}
+	}
+}
+
 static bool population_engine_select_vendor_spawn(const std::vector<std::shared_ptr<PopulationEngine>>& profiles,
-	const std::unordered_set<std::string>& excluded, std::shared_ptr<PopulationEngine>& selected, int16& selected_map)
+	const std::unordered_set<std::string>& excluded, std::shared_ptr<PopulationEngine>& selected, int16& selected_map,
+	const std::unordered_set<int16_t>* allowed_maps = nullptr)
 {
 	selected.reset();
 	selected_map = -1;
@@ -1111,7 +1164,7 @@ static bool population_engine_select_vendor_spawn(const std::vector<std::shared_
 			for (const auto& pair : placements->second) {
 				const auto& vp = pair.second;
 				const int16 mid = map_mapname2mapid(vp.map.c_str());
-				if (mid < 0 || excluded.count(profile->vendor_key + "@" + vp.map)) continue;
+				if (mid < 0 || (allowed_maps != nullptr && !allowed_maps->count(mid)) || excluded.count(profile->vendor_key + "@" + vp.map)) continue;
 				size_t key_count = 0, profile_count = 0;
 				for (auto* bot : g_population_engine_pcs) {
 					if (!bot || bot->m != mid || !bot->pop.profile_config) continue;
@@ -1170,6 +1223,48 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	if (!g_population_engine_running.load(std::memory_order_relaxed))
 		return 0;
 
+	const bool active_only = (battle_config.population_engine_active_maps_only != 0);
+	std::unordered_set<int16_t> direct_maps;
+	std::unordered_set<int16_t> active_maps;
+	std::unordered_set<int16_t> vendor_maps;
+	if (active_only) {
+		population_engine_collect_active_maps(direct_maps, active_maps, vendor_maps);
+		const t_tick now = gettick();
+		for (const int16_t mid : active_maps)
+			g_pop_map_last_active_tick[mid] = now;
+
+		if (battle_config.population_engine_empty_map_despawn_sec > 0) {
+			const t_tick grace_ms = static_cast<t_tick>(battle_config.population_engine_empty_map_despawn_sec) * 1000;
+			std::vector<map_session_data*> to_despawn;
+			for (map_session_data* bot : g_population_engine_pcs) {
+				if (!bot || bot->pop.companion_owner != 0 || bot->pop.arena_team != 0)
+					continue;
+				const int16_t check_mid = (bot->pop.spawn_map_id >= 0) ? bot->pop.spawn_map_id : bot->m;
+				if (active_maps.count(check_mid))
+					continue;
+				const bool is_vendor = (bot->pop.behavior_base == static_cast<uint8>(PopulationBehavior::Vendor) ||
+					bot->pop.behavior == static_cast<uint8>(PopulationBehavior::Vendor));
+				if (battle_config.population_engine_keep_vendor_maps && is_vendor && vendor_maps.count(check_mid))
+					continue;
+				const auto last_it = g_pop_map_last_active_tick.find(check_mid);
+				if (last_it == g_pop_map_last_active_tick.end() || DIFF_TICK(now, last_it->second) >= grace_ms)
+					to_despawn.push_back(bot);
+			}
+			for (map_session_data* bot : to_despawn)
+				population_engine_remove_managed_shell(bot);
+
+			for (auto it = g_pop_map_last_active_tick.begin(); it != g_pop_map_last_active_tick.end(); ) {
+				if (!active_maps.count(it->first) && DIFF_TICK(now, it->second) >= grace_ms)
+					it = g_pop_map_last_active_tick.erase(it);
+				else
+					++it;
+			}
+			const uint32_t cur = static_cast<uint32_t>(g_population_engine_count.load(std::memory_order_relaxed));
+			if (cur != g_last_db_written_count)
+				population_engine_write_count_sql(cur);
+		}
+	}
+
 	if (g_population_engine_count.load() >= max_global)
 		return 0;
 
@@ -1177,63 +1272,74 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	size_t tick_budget = (batch_cfg > 0) ? static_cast<size_t>(batch_cfg) : 0;
 	size_t* pbudget = (batch_cfg > 0) ? &tick_budget : nullptr;
 
-	for (auto it = population_spawn_db().begin();
-		 it != population_spawn_db().end(); ++it)
-	{
-		if (!it->second)
-			continue;
-		const PopulationSpawnEntry& se = *it->second;
+	auto run_spawn_passes = [&](const std::unordered_set<int16_t>* allowed_maps) -> bool {
+		for (auto it = population_spawn_db().begin();
+			 it != population_spawn_db().end(); ++it)
+		{
+			if (!it->second)
+				continue;
+			const PopulationSpawnEntry& se = *it->second;
 
-		// Resolve Profile -> list of jobs that inherit from it. The pool is the
-		// jobs declared in db/population_engine.yml whose Profile: matches; if
-		// none match, the entry is silently skipped (no jobs to spawn).
-		std::vector<uint16_t> profile_jobs = population_engine_db().jobs_with_profile(se.profile_name);
-		if (profile_jobs.empty())
-			continue;
+			// Resolve Profile -> list of jobs that inherit from it. The pool is the
+			// jobs declared in db/population_engine.yml whose Profile: matches; if
+			// none match, the entry is silently skipped (no jobs to spawn).
+			std::vector<uint16_t> profile_jobs = population_engine_db().jobs_with_profile(se.profile_name);
+			if (profile_jobs.empty())
+				continue;
 
-		// Distribute `population` shells across `maps`: base = floor(pop/N),
-		// first (pop%N) maps get base+1 to guarantee sum == population exactly.
-		// max_per_map > 0 applies an additional per-map hard cap after distribution.
-		// Jobs are picked at random per shell from `profile_jobs` so the spawn
-		// is spread across every job that inherits the profile. bypass_existing_check
-		// is passed to autosummon_fill_map so the per-job dedupe gate (which would
-		// allow only one shell of a given job per map) does not throttle the
-		// per-shell loop here.
-		auto fill_category = [&](const std::vector<std::string>& maps, int32_t population, int32_t max_per_map, uint8_t category) -> bool {
-			if (population <= 0 || maps.empty())
-				return false;
-			const size_t pop   = static_cast<size_t>(population);
-			const size_t count = maps.size();
-			const size_t base  = pop / count;
-			const size_t extra = pop % count;
-			for (size_t i = 0; i < count; ++i) {
-				if (pbudget != nullptr && *pbudget == 0) return true;
-				size_t target = base + (i < extra ? 1u : 0u);
-				if (max_per_map > 0 && target > static_cast<size_t>(max_per_map))
-					target = static_cast<size_t>(max_per_map);
-				if (target == 0) continue;
-				const int16 mid = map_mapname2mapid(maps[i].c_str());
-				if (mid < 0) continue;
-				// Only spawn the deficit so the timer never stacks more shells
-				// than the YAML quota onto a map that is already at capacity.
-				const size_t existing_on_map =
-					population_engine_count_shells_on_map_for_profile(mid, profile_jobs);
-				if (existing_on_map >= target) continue;
-				const size_t deficit = target - existing_on_map;
-				for (size_t s = 0; s < deficit; ++s) {
+			// Distribute `population` shells across `maps`: base = floor(pop/N),
+			// first (pop%N) maps get base+1 to guarantee sum == population exactly.
+			// max_per_map > 0 applies an additional per-map hard cap after distribution.
+			// Jobs are picked at random per shell from `profile_jobs` so the spawn
+			// is spread across every job that inherits the profile. bypass_existing_check
+			// is passed to autosummon_fill_map so the per-job dedupe gate (which would
+			// allow only one shell of a given job per map) does not throttle the
+			// per-shell loop here.
+			auto fill_category = [&](const std::vector<std::string>& maps, int32_t population, int32_t max_per_map, uint8_t category) -> bool {
+				if (population <= 0 || maps.empty())
+					return false;
+				const size_t pop   = static_cast<size_t>(population);
+				const size_t count = maps.size();
+				const size_t base  = pop / count;
+				const size_t extra = pop % count;
+				for (size_t i = 0; i < count; ++i) {
 					if (pbudget != nullptr && *pbudget == 0) return true;
+					size_t target = base + (i < extra ? 1u : 0u);
+					if (max_per_map > 0 && target > static_cast<size_t>(max_per_map))
+						target = static_cast<size_t>(max_per_map);
+					if (target == 0) continue;
+					const int16 mid = map_mapname2mapid(maps[i].c_str());
+					if (mid < 0) continue;
+					if (allowed_maps != nullptr && !allowed_maps->count(mid)) continue;
+					// Only spawn the deficit so the timer never stacks more shells
+					// than the YAML quota onto a map that is already at capacity.
+					const size_t existing_on_map =
+						population_engine_count_shells_on_map_for_profile(mid, profile_jobs);
+					if (existing_on_map >= target) continue;
+					const size_t deficit = target - existing_on_map;
+					for (size_t s = 0; s < deficit; ++s) {
+						if (pbudget != nullptr && *pbudget == 0) return true;
+						if (g_population_engine_count.load() >= max_global) return true;
+						const uint16_t pick = profile_jobs[rnd() % profile_jobs.size()];
+						autosummon_fill_map(mid, 1, pick, pbudget, category, /*bypass_existing_check=*/true);
+					}
 					if (g_population_engine_count.load() >= max_global) return true;
-					const uint16_t pick = profile_jobs[rnd() % profile_jobs.size()];
-					autosummon_fill_map(mid, 1, pick, pbudget, category, /*bypass_existing_check=*/true);
 				}
-				if (g_population_engine_count.load() >= max_global) return true;
-			}
-			return false;
-		};
+				return false;
+			};
 
-		if (fill_category(se.towns,    se.towns_population,    se.towns_max_per_map,    1)) return 0;
-		if (fill_category(se.fields,   se.fields_population,   se.fields_max_per_map,   2)) return 0;
-		if (fill_category(se.dungeons, se.dungeons_population, se.dungeons_max_per_map, 3)) return 0;
+			if (fill_category(se.towns,    se.towns_population,    se.towns_max_per_map,    1)) return true;
+			if (fill_category(se.fields,   se.fields_population,   se.fields_max_per_map,   2)) return true;
+			if (fill_category(se.dungeons, se.dungeons_population, se.dungeons_max_per_map, 3)) return true;
+		}
+		return false;
+	};
+
+	if (active_only) {
+		if (!run_spawn_passes(&direct_maps))
+			run_spawn_passes(&active_maps);
+	} else {
+		run_spawn_passes(nullptr);
 	}
 
 	// One permanent hangout at each configured post. Posts are map-thread owned.
@@ -1251,6 +1357,7 @@ TIMER_FUNC(population_engine_autosummon_timer)
 			})) continue;
 			const int16 mid = map_mapname2mapid(post.map.c_str());
 			if (mid < 0) continue;
+			if (active_only && !active_maps.count(mid)) continue;
 			const auto job = jobs[rnd() % jobs.size()];
 			if (autosummon_fill_map(mid, 1, job, pbudget, 1, true, population_engine_db().find(job), post.x, post.y)) {
 				auto* bot = g_population_engine_pcs.back();
@@ -1267,17 +1374,45 @@ TIMER_FUNC(population_engine_autosummon_timer)
 	// Choose the least represented profile/key first so large shop catalogs
 	// receive one of each before any profile receives a duplicate.
 	const auto& profiles = population_vendor_pop_db().shell_profiles();
+	const std::unordered_set<int16_t>* vendor_filter =
+		(active_only && !battle_config.population_engine_keep_vendor_maps) ? &active_maps : nullptr;
 	std::unordered_set<std::string> excluded;
 	for (size_t pass = 0; pass < max_global; ++pass) {
 		std::shared_ptr<PopulationEngine> selected;
 		int16 selected_map = -1;
-		population_engine_select_vendor_spawn(profiles, excluded, selected, selected_map);
+		population_engine_select_vendor_spawn(profiles, excluded, selected, selected_map, vendor_filter);
 		if (!selected || (pbudget && *pbudget == 0) || g_population_engine_count.load() >= max_global) break;
 		if (!autosummon_fill_map(selected_map, 1, selected->job_id, pbudget, 1, true, selected))
 			excluded.insert(selected->vendor_key + "@" + map_mapid2mapname(selected_map));
 	}
 
+	{
+		const uint32_t cur = static_cast<uint32_t>(g_population_engine_count.load(std::memory_order_relaxed));
+		if (cur != g_last_db_written_count)
+			population_engine_write_count_sql(cur);
+	}
+
 	return 0;
+}
+
+TIMER_FUNC(population_engine_proximity_trigger_timer)
+{
+	g_pop_proximity_trigger_timer = INVALID_TIMER;
+	if (g_population_engine_running.load(std::memory_order_relaxed))
+		population_engine_autosummon_timer(INVALID_TIMER, tick, 0, 0);
+	return 0;
+}
+
+void population_engine_on_real_player_enter_map(map_session_data *sd)
+{
+	if (!sd || population_engine_is_population_pc(sd->id))
+		return;
+	if (!battle_config.population_engine_active_maps_only || !g_population_engine_running.load(std::memory_order_relaxed))
+		return;
+	if (sd->m >= 0)
+		g_pop_map_last_active_tick[sd->m] = gettick();
+	if (g_pop_proximity_trigger_timer == INVALID_TIMER)
+		g_pop_proximity_trigger_timer = add_timer(gettick() + 250, population_engine_proximity_trigger_timer, 0, 0);
 }
 
 /// Tick a single bot if it qualifies. Called for each block_list within range
@@ -1660,6 +1795,7 @@ void do_init_population_engine() {
 	add_timer_func_list(population_engine_chat_timer, "population_engine_chat_timer");
 	add_timer_func_list(population_engine_global_combat_timer, "population_engine_global_combat_timer");
 	add_timer_func_list(population_engine_respawn_shell_timer, "population_engine_respawn_shell_timer");
+	add_timer_func_list(population_engine_proximity_trigger_timer, "population_engine_proximity_trigger_timer");
 	population_engine_path_register_timer_funcs();
 }
 
@@ -2864,6 +3000,25 @@ static void population_engine_start_shell_vendor(map_session_data* sd, const Pop
 	}
 }
 
+static void population_engine_apply_palette_clamps(uint8_t& hair_style, uint16_t& hair_color, uint16_t& cloth_color)
+{
+	if (battle_config.population_engine_max_hair_style > 0) {
+		const int32 max_hs = battle_config.population_engine_max_hair_style;
+		if (hair_style < 1 || hair_style > max_hs)
+			hair_style = static_cast<uint8_t>(1 + (rnd() % static_cast<uint32_t>(max_hs)));
+	}
+	if (battle_config.population_engine_max_hair_color >= 0) {
+		const int32 max_hc = battle_config.population_engine_max_hair_color;
+		if (hair_color > max_hc)
+			hair_color = (max_hc == 0) ? 0 : static_cast<uint16_t>(rnd() % static_cast<uint32_t>(max_hc + 1));
+	}
+	if (battle_config.population_engine_max_cloth_color >= 0) {
+		const int32 max_cc = battle_config.population_engine_max_cloth_color;
+		if (cloth_color > max_cc)
+			cloth_color = (max_cc == 0) ? 0 : static_cast<uint16_t>(rnd() % static_cast<uint32_t>(max_cc + 1));
+	}
+}
+
 static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, int y, uint32_t index,
 	uint16_t job_id, char sex, uint8_t hair_style, uint16_t hair_color,
 	uint16_t weapon, uint16_t shield, uint16_t head_top, uint16_t head_mid,
@@ -2901,6 +3056,7 @@ static map_session_data* population_engine_spawn_shell(int16_t map_id, int x, in
 			eff_cloth = static_cast<uint16_t>(cap_value(population_roll_closed_range(pop_cfg->cloth_color_min, hmax), MIN_CLOTH_COLOR, MAX_CLOTH_COLOR));
 		}
 	}
+	population_engine_apply_palette_clamps(eff_hair, eff_hair_color, eff_cloth);
 
 	std::string name = generate_population_pc_name(index, pop_cfg);
 	const uint32_t account_id = POPULATION_ENGINE_ACCOUNT_ID_BASE + index;
@@ -3786,6 +3942,12 @@ void population_engine_stop() {
 			delete_timer(g_population_combat_global_timer, population_engine_global_combat_timer);
 		g_population_combat_global_timer = INVALID_TIMER;
 	}
+	if (g_pop_proximity_trigger_timer != INVALID_TIMER) {
+		const TimerData* tdp = get_timer(g_pop_proximity_trigger_timer);
+		if (tdp && tdp->func == population_engine_proximity_trigger_timer)
+			delete_timer(g_pop_proximity_trigger_timer, population_engine_proximity_trigger_timer);
+		g_pop_proximity_trigger_timer = INVALID_TIMER;
+	}
 	population_engine_path_stop_wander_timer();
 
 	if (!g_population_engine_running && g_population_engine_pcs.empty())
@@ -3797,6 +3959,7 @@ void population_engine_stop() {
 	g_population_engine_stats = PopulationEngineStats();
 	g_population_engine_running = false;
 	g_pop_chat_next_tick.clear();
+	g_pop_map_last_active_tick.clear();
 	population_engine_path_clear_all();
 	population_engine_shell_index_clear();
 	g_chat_cursor = 0;

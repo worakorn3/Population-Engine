@@ -3603,9 +3603,25 @@ int32 mob_dead(mob_data *md, block_list *src, int32 type)
 			} else
 				npc_event_do(md->npc_event);
 		} else if( first_sd != nullptr && !md->state.npc_killmonster ) {
-			pc_setparam(first_sd, SP_KILLEDGID, md->id);
-			pc_setparam(first_sd, SP_KILLEDRID, md->mob_id);
-			npc_script_event( *first_sd, NPCE_KILLNPC );
+			map_session_data* kill_sd = first_sd;
+			if (IS_POPULATION_ENGINE_ACCOUNT_ID(kill_sd->status.account_id)) {
+				map_session_data* owner_sd = (kill_sd->pop.companion_owner != 0) ? map_charid2sd(kill_sd->pop.companion_owner) : nullptr;
+				if (owner_sd == nullptr && kill_sd->status.party_id > 0) {
+					struct party_data* p = party_search(kill_sd->status.party_id);
+					if (p != nullptr) {
+						for (int i = 0; i < MAX_PARTY; ++i) {
+							if (p->data[i].sd != nullptr && !IS_POPULATION_ENGINE_ACCOUNT_ID(p->data[i].sd->status.account_id) && p->data[i].sd->m == kill_sd->m) {
+								owner_sd = p->data[i].sd;
+								break;
+							}
+						}
+					}
+				}
+				kill_sd = (owner_sd != nullptr && owner_sd->m == first_sd->m) ? owner_sd : first_sd;
+			}
+			pc_setparam(kill_sd, SP_KILLEDGID, md->id);
+			pc_setparam(kill_sd, SP_KILLEDRID, md->mob_id);
+			npc_script_event( *kill_sd, NPCE_KILLNPC );
 		}
 	}
 

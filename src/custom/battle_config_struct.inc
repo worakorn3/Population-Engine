@@ -92,3 +92,15 @@ int32 population_engine_vending_enable;
 /// global in population_engine.cpp. This field signals that a custom pool was configured (1=yes,0=no).
 int32 population_engine_arena_custom_pool;
 int32 population_engine_path_attempts;
+/// Proximity spawning: 0 = spawn all configured maps (upstream default), 1 = only spawn on maps with real players (+ hops).
+int32 population_engine_active_maps_only;
+/// BFS warp-hop radius around real players when active_maps_only is enabled (0 = current map only, 1 = current + 1-hop neighbors).
+int32 population_engine_active_map_hops;
+/// Grace period in seconds before despawning ambient/post shells on maps that are no longer active (0 = never despawn).
+int32 population_engine_empty_map_despawn_sec;
+/// Keep VendorPlacement market maps spawned and exempt from proximity despawn even when no player is nearby (1 = on, 0 = off).
+int32 population_engine_keep_vendor_maps;
+/// Optional vanilla-GRF safety clamps (-1/0 = disabled, use client.conf/YAML limits).
+int32 population_engine_max_hair_style;
+int32 population_engine_max_hair_color;
+int32 population_engine_max_cloth_color;
